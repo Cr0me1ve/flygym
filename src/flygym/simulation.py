@@ -432,6 +432,15 @@ class Simulation:
             fly's two eyes. The first dimension corresponds to the left and right eye,
             in that order.
         """
+        return np.array(
+            [
+                self.retina.correct_fisheye(frame)
+                for frame in self._render_eye_frames(fly_name)
+            ]
+        )
+
+    def _render_eye_frames(self, fly_name: str):
+        """Yield raw eye frames; consume each before rendering the next eye."""
         try:
             internal_eye_camera_ids = self._intern_eye_camera_ids_by_fly[fly_name]
         except KeyError:
@@ -460,16 +469,12 @@ class Simulation:
             self.eye_renderer_scene_option.geomgroup[1] = 0
             self.eye_renderer_scene_option.geomgroup[2] = 0
 
-        # Render each eye camera and apply fisheye correction
-        frames = []
+        # Render each eye camera.
         for cam_id in internal_eye_camera_ids:
             self.eye_renderer.update_scene(
                 self.mj_data, cam_id, scene_option=self.eye_renderer_scene_option
             )
-            raw_frame = self.eye_renderer.render()
-            fish_img = self.retina.correct_fisheye(raw_frame)
-            frames.append(fish_img)
-        return np.array(frames)
+            yield self.eye_renderer.render()
 
     def get_ommatidia_readouts(
         self, fly_name: str
@@ -488,9 +493,11 @@ class Simulation:
             For example, if `readouts[0, 5, 0]` is 0, it means that the 5th ommatidium
             is of pale type, and the user should look at `readouts[0, 5, 1]` instead.
         """
-        raw_vision = self.get_raw_vision(fly_name)
         ommatidia_readouts = np.array(
-            [self.retina.raw_image_to_hex_pxls(image) for image in raw_vision],
+            [
+                self.retina.fisheye_image_to_hex_pxls(frame)
+                for frame in self._render_eye_frames(fly_name)
+            ],
             dtype=np.float32,
         )
         return ommatidia_readouts

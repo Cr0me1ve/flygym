@@ -131,6 +131,79 @@ class Retina:
             self.pale_type_mask,
         )
 
+    def fisheye_image_to_hex_pxls(self, raw_img: np.ndarray) -> np.ndarray:
+        """Apply fisheye correction and pool a raw camera image into ommatidia.
+
+        Equivalent to ``raw_image_to_hex_pxls(correct_fisheye(raw_img))``
+        for uint8 RGB images, without allocating the corrected RGB image.
+        The source-pixel lookup is reused until the image dimensions, zoom,
+        or distortion coefficient change. Retinal maps and masks are read
+        on every call, so in-place edits remain visible.
+
+        Parameters
+        ----------
+        raw_img : np.ndarray
+            Rectilinear uint8 RGB camera image of shape (nrows, ncols, 3).
+
+        Returns
+        -------
+        np.ndarray
+            Float64 readings of shape (N, 2), as in raw_image_to_hex_pxls.
+        """
+        if raw_img.shape != (self.nrows, self.ncols, 3):
+            raise ValueError(
+                "Image shape must match the Retina dimensions and RGB channels"
+            )
+        if raw_img.dtype != np.uint8:
+            raise ValueError("Raw camera image must have dtype uint8")
+        if self.ommatidia_id_map.shape != (self.nrows, self.ncols):
+            raise ValueError("Ommatidia map shape must match the Retina dimensions")
+        key = (self.nrows, self.ncols, self.zoom, self.distortion_coefficient)
+        if getattr(self, "_fisheye_lookup_key", None) != key:
+            self._fisheye_lookup = self._make_fisheye_lookup(*key)
+            self._fisheye_lookup_key = key
+        return self._pool_fisheye(
+            np.ascontiguousarray(raw_img),
+            self._fisheye_lookup,
+            self.ommatidia_id_map,
+            self.num_pixels_per_ommatidia,
+            self.pale_type_mask,
+        )
+
+    @staticmethod
+    @nb.njit(cache=True)
+    def _make_fisheye_lookup(nrows, ncols, zoom, distortion_coefficient):
+        # Match _correct_fisheye's arithmetic and truncation toward zero.
+        lookup = np.full(nrows * ncols, -1, dtype=np.int64)
+        for row in range(nrows):
+            for col in range(ncols):
+                row_norm = ((2 * row - nrows) / nrows) / zoom
+                col_norm = ((2 * col - ncols) / ncols) / zoom
+                radius_sq = col_norm**2 + row_norm**2
+                denom = 1 - distortion_coefficient * radius_sq + 1e-6
+                src_row = int(((row_norm / denom + 1) * nrows) / 2)
+                src_col = int(((col_norm / denom + 1) * ncols) / 2)
+                if 0 <= src_row < nrows and 0 <= src_col < ncols:
+                    lookup[row * ncols + col] = src_row * ncols + src_col
+        return lookup
+
+    @staticmethod
+    @nb.njit(cache=True)
+    def _pool_fisheye(img, lookup, id_map, counts, pale_type_mask):
+        vals = np.zeros((len(counts), 2))
+        pixels = img.reshape((-1, 3))
+        ids = id_map.ravel()
+        # Preserve the reference's row-major accumulation and division order.
+        for i in range(ids.size):
+            ommatidium = ids[i] - 1
+            source = lookup[i]
+            if ommatidium >= 0 and source >= 0:
+                channel = pale_type_mask[ommatidium]
+                vals[ommatidium, channel] += (
+                    pixels[source, channel + 1] / counts[ommatidium]
+                )
+        return vals / 255
+
     def hex_pxls_to_human_readable(
         self, ommatidia_reading: np.ndarray, color_8bit=False, default_value=0
     ) -> np.ndarray:
