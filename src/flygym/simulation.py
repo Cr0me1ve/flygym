@@ -1,4 +1,5 @@
 from collections import defaultdict
+import operator
 from time import perf_counter_ns
 from typing import Any, Literal
 
@@ -61,6 +62,7 @@ class Simulation:
 
         self.eye_renderer = None
         self.retina = None
+        self._vision_cache = {}
 
         # For performance profiling
         self._curr_step = 0
@@ -83,6 +85,8 @@ class Simulation:
         # Reset physics
         mj.mj_resetDataKeyframe(self.mj_model, self.mj_data, self._neutral_keyframe_id)
 
+        self.clear_vision_cache()
+
         # Reset renderers
         if self.renderer is not None:
             self.renderer.reset()
@@ -95,17 +99,25 @@ class Simulation:
         self._total_physics_time_ns = 0
         self._total_render_time_ns = 0
 
-    def step(self) -> None:
-        """Advance physics by one timestep."""
-        mj.mj_step(self.mj_model, self.mj_data)
+    def step(self, nstep: int = 1) -> None:
+        """Advance by ``nstep`` native physics steps under the current controls.
 
-    def step_with_profile(self) -> None:
-        """Advance physics by one timestep, accumulating timing data for profiling."""
+        The model timestep is unchanged. Python-side controllers, observations
+        and rendering are not called between substeps; MuJoCo callbacks still
+        run normally. Use single steps when those Python updates are required.
+        """
+        nstep = operator.index(nstep)
+        if nstep < 1:
+            raise ValueError("nstep must be positive")
+        mj.mj_step(self.mj_model, self.mj_data, nstep=nstep)
+
+    def step_with_profile(self, nstep: int = 1) -> None:
+        """Advance physics, accumulating elapsed time and physical step count."""
         physics_start_ns = perf_counter_ns()
-        self.step()
+        self.step(nstep)
         physics_finish_ns = perf_counter_ns()
         self._total_physics_time_ns += physics_finish_ns - physics_start_ns
-        self._curr_step += 1
+        self._curr_step += nstep
 
     def set_renderer(
         self,
@@ -322,13 +334,16 @@ class Simulation:
                 geom2_requested & geom1_is_ground
             )
 
-        contact_wrench = np.zeros(6, dtype=float)
+        # Reuse fixed-size scratch across queries; returned forces own their data.
+        if not hasattr(self, "_contact_force_scratch"):
+            self._contact_force_scratch = (np.empty(6), np.empty(3))
+        contact_wrench, world_force = self._contact_force_scratch
         for contact_id in np.where(active)[0]:
             mj.mj_contactForce(
                 self.mj_model, self.mj_data, int(contact_id), contact_wrench
             )
             frame = contacts.frame[contact_id].reshape(3, 3)
-            world_force = frame.T @ contact_wrench[:3]
+            np.matmul(frame.T, contact_wrench[:3], out=world_force)
 
             g1, g2 = int(geom1_arr[contact_id]), int(geom2_arr[contact_id])
             if g1 in requested_geom_to_output:
@@ -477,12 +492,17 @@ class Simulation:
             yield self.eye_renderer.render()
 
     def get_ommatidia_readouts(
-        self, fly_name: str
+        self, fly_name: str, *, refresh_interval: float | None = None
     ) -> Float[np.ndarray, "n_cameras n_ommatidia 2"]:
         """Convert the rendered eye frames into ommatidia readouts.
 
         Args:
             fly_name: Name of the fly to query.
+            refresh_interval: Optional positive interval in simulation seconds.
+                Frames are held between refreshes. None (default) always renders.
+                Clear the cache after external state/model/retina/scene edits or
+                checkpoint restore; reset() clears it automatically. Returned
+                arrays are independent copies, so callers cannot alter the cache.
 
         Returns:
             A float32 array with shape ``(2, n_ommatidia, 2)`` containing
@@ -493,6 +513,22 @@ class Simulation:
             For example, if `readouts[0, 5, 0]` is 0, it means that the 5th ommatidium
             is of pale type, and the user should look at `readouts[0, 5, 1]` instead.
         """
+        if refresh_interval is not None:
+            if not np.isfinite(refresh_interval) or refresh_interval <= 0:
+                raise ValueError("refresh_interval must be finite and positive")
+        cache = getattr(self, "_vision_cache", None)
+        if cache is None:
+            cache = self._vision_cache = {}
+        now = float(self.mj_data.time)
+        entry = cache.get(fly_name)
+        if refresh_interval is not None and entry is not None:
+            stamp, due, interval, retina, frame = entry
+            if (
+                interval == refresh_interval
+                and retina is self.retina
+                and stamp <= now < due
+            ):
+                return frame.copy()
         ommatidia_readouts = np.array(
             [
                 self.retina.fisheye_image_to_hex_pxls(frame)
@@ -500,7 +536,48 @@ class Simulation:
             ],
             dtype=np.float32,
         )
+        if refresh_interval is None:
+            cache.pop(fly_name, None)
+        else:
+            due = now + refresh_interval
+            if entry is not None:
+                stamp, previous_due, interval, retina, _ = entry
+                if (
+                    interval == refresh_interval
+                    and retina is self.retina
+                    and now >= previous_due
+                ):
+                    # Keep the original cadence after a delayed query; do not
+                    # render missed frames or move the schedule on each call.
+                    periods = np.floor((now - previous_due) / refresh_interval) + 1
+                    due = previous_due + periods * refresh_interval
+            cache[fly_name] = (
+                now,
+                due,
+                refresh_interval,
+                self.retina,
+                ommatidia_readouts.copy(),
+            )
         return ommatidia_readouts
+
+    def clear_vision_cache(self, fly_name: str | None = None) -> None:
+        """Invalidate held vision after external edits or restoring physics state."""
+        if not hasattr(self, "_vision_cache"):
+            self._vision_cache = {}
+        if fly_name is None:
+            self._vision_cache.clear()
+        else:
+            self._vision_cache.pop(fly_name, None)
+
+    def warmup_vision(self, fly_name: str) -> None:
+        """Render and discard one visual observation without stepping physics.
+
+        This prepares the renderer, lookup and JIT kernels. It does not consume
+        the first scheduled frame. Forward physics first if the current derived
+        transforms have not yet been computed (for example, after reset()).
+        """
+        self.get_ommatidia_readouts(fly_name)
+        self.clear_vision_cache(fly_name)
 
     def warmup(self, duration_s: float = 0.05) -> None:
         """Step the simulation for a short period to settle initialization transients.

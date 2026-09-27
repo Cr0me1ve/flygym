@@ -1,6 +1,7 @@
 """Exact equivalence of fused and two-stage retinal sampling."""
 
 from unittest.mock import Mock
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -71,7 +72,7 @@ def test_simulation_paths():
     sim = object.__new__(Simulation)
     sim.retina = Retina()
     sim._intern_eye_camera_ids_by_fly = {"fly": [3, 7]}
-    sim.mj_data = object()
+    sim.mj_data = SimpleNamespace(time=0.0)
     sim.eye_renderer_scene_option = object()
     sim.eye_renderer = Mock()
     rng = np.random.default_rng(5)
@@ -100,7 +101,7 @@ def test_lazy_renderer_initialization(monkeypatch, method):
     sim.retina = None
     sim.eye_renderer = None
     sim.mj_model = object()
-    sim.mj_data = object()
+    sim.mj_data = SimpleNamespace(time=0.0)
     sim._intern_eye_camera_ids_by_fly = {"fly": [0, 1]}
     renderer = Mock()
     retina = Retina()
